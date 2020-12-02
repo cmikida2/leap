@@ -1166,7 +1166,7 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
             early_hist_consistency_threshold=None,
             rtol=0, atol=0, max_dt_growth=5,
             min_dt_shrinkage=0.1,
-            use_high_order=False):
+            use_high_order=True):
 
         """
         :arg default_order: The order to be used for right-hand sides
@@ -1417,178 +1417,294 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
 
         cb(self.bootstrap_step, 0)
 
+    def norm(expr):
+        return var("<builtin>norm_2")(expr)
+
+    def finish_rk_step(self, cb, component_state_ests):
+        from pymbolic import var
+        from pymbolic.primitives import Comparison, LogicalOr, Max, Min
+        from dagrt.expression import IfThenElse
+        array = var("<builtin>array")
+
+        def norm(expr):
+            return var("<builtin>norm_2")(expr)
+
+        norm_start_state = var("norm_start_state")
+        norm_end_state = var("norm_end_state")
+        rel_error_raw = var("rel_error_raw")
+        rel_error = var("rel_error")
+        dt_cand = var("dt_cand")
+        dt_cand_min = var("dt_cand_min")
+        rel_error_check = var("rel_error_check")
+        cb(rel_error, array(len(self.component_names)))
+
+        cb(rel_error_check, 0)
+        cb(dt_cand_min, 1000.0)
+        for i, component_name in enumerate(self.component_names):
+            state_low = component_state_ests[component_name]["low_order"]
+            state_high = component_state_ests[component_name]["high_order"]
+            cb(norm_start_state, norm(var("<state>"+component_name)))
+            cb(norm_end_state, norm(state_low))
+            cb(rel_error_raw, norm(state_high - state_low)
+                    / (var("<builtin>len")(var("<state>"+component_name)) ** 0.5
+                        * (
+                            self.atol + self.rtol
+                            * Max((norm_start_state, norm_end_state))
+                            )))
+
+            cb(rel_error[i], IfThenElse(Comparison(rel_error_raw, "==", 0),
+                                    1.0e-14, rel_error_raw))
+
+            with cb.if_(LogicalOr((Comparison(rel_error[i], ">", 1),
+                                var("<builtin>isnan")(rel_error[i])))):
+
+                cb(rel_error_check, 1)
+                with cb.if_(var("<builtin>isnan")(rel_error[i])):
+                    cb(dt_cand, self.min_dt_shrinkage * self.dt)
+                with cb.else_():
+                    cb(dt_cand, Max((0.9 * self.dt
+                        * rel_error[i] ** (-1 / self.high_order),
+                        self.min_dt_shrinkage * self.dt)))
+                with cb.if_(dt_cand, "<", dt_cand_min):
+                    cb(dt_cand_min, dt_cand)
+
+        # From all candidates, choose the new dt.
+        with cb.if_(rel_error_check, "==", 1):
+            cb(self.dt, dt_cand_min)
+            with cb.if_(self.t + self.dt, "==", self.t):
+                cb.raise_(TimeStepUnderflow)
+            with cb.else_():
+                cb(var("printer"), var("<builtin>print")("failed in rk step check"))
+                cb.fail_step()
+
+        with cb.else_():
+            # This updates <t>: <dt> should not be set before this is called.
+            for component_name in self.component_names:
+                state_high = component_state_ests[component_name]["high_order"]
+                state_low = component_state_ests[component_name]["low_order"]
+                if self.use_high_order:
+                    state = state_high
+                else:
+                    state = state_low
+                if self.is_ode_component[component_name]:
+                    cb.yield_state(
+                            state,
+                            component_name, self.t + self.dt/self.nsubsteps,
+                            "bootstrap")
+
+                cb(var("<state>"+component_name), state)
+
+            cb(self.t, self.t + self.dt/self.nsubsteps)
+
+            cb(dt_cand_min, 1000.0)
+            for i, component_name in enumerate(self.component_names):
+                cb(dt_cand,
+                    Min((0.9 * self.dt * rel_error[i] ** (-1 / self.high_order),
+                        self.max_dt_growth * self.dt)))
+                with cb.if_(dt_cand, "<", dt_cand_min):
+                    cb(dt_cand_min, dt_cand)
+
+            cb(self.dt, dt_cand_min)
+
     # {{{ rk bootstrap: step
 
     def emit_small_rk_step(self, cb, name_prefix, name_gen, rhss_on_entry):
         """Emit a single step of an RK method."""
 
-        from leap.rk import ORDER_TO_RK_METHOD_BUILDER
-        rk_method = ORDER_TO_RK_METHOD_BUILDER[self.max_order]
+        # This needs to be adaptive/embedded.
+        from leap.rk import EMBEDDED_ORDER_TO_RK_METHOD_BUILDER
+        rk_method = EMBEDDED_ORDER_TO_RK_METHOD_BUILDER[self.high_order]
         rk_tableau = tuple(zip(rk_method.c, rk_method.a_explicit))
-        rk_coeffs = rk_method.output_coeffs
+        stage_coeff_set_names = ("explicit",)
+        stage_coeff_sets = {"explicit": rk_method.a_explicit}
+        high_order_coeffs = rk_method.high_order_coeffs
+        low_order_coeffs = rk_method.low_order_coeffs
+        estimate_coeff_set_names = ("high_order", "low_order")
+        estimate_coeff_sets = {"high_order": high_order_coeffs,
+                               "low_order": low_order_coeffs}
 
         def make_stage_history(prefix):
             return [var(prefix + "_stage" + str(i)) for i in range(len(rk_tableau))]
 
         stage_rhss = {}
         for comp_name, component_rhss in zip(self.component_names, self.rhss):
+            stage_rhss[comp_name] = {}
             if not self.is_ode_component[comp_name]:
                 continue
 
-            for irhs, rhs in enumerate(component_rhss):
-                stage_rhss[comp_name, irhs] = make_stage_history(
-                        "{name_prefix}_rk_{comp_name}_rhs{irhs}"
-                        .format(
-                            name_prefix=name_prefix,
-                            comp_name=comp_name,
-                            irhs=irhs))
+            from pymbolic import var
+            for name in stage_coeff_set_names:
+                for irhs, rhs in enumerate(component_rhss):
+                    stage_rhss[comp_name][name, irhs] = make_stage_history(
+                            "{name_prefix}_rk_{comp_name}_{name}_rhs{irhs}"
+                            .format(
+                                name_prefix=name_prefix,
+                                comp_name=comp_name,
+                                name=name,
+                                irhs=irhs))
 
-        for istage, (c, coeffs) in enumerate(rk_tableau):
-            if len(coeffs) == 0:
-                assert c == 0
-                for comp_name, component_rhss in zip(
-                        self.component_names, self.rhss):
-                    if not self.is_ode_component[comp_name]:
-                        continue
+        for istage in range(len(rk_method.c)):
+            component_state_ests = {}
+            for name in stage_coeff_set_names:
+                component_state_ests[name] = {}
+                c = rk_method.c[istage]
+                coeffs = stage_coeff_sets[name][istage]
+                if len(coeffs) == 0:
+                    assert c == 0
+                    for comp_name, component_rhss in zip(
+                            self.component_names, self.rhss):
+                        if not self.is_ode_component[comp_name]:
+                            continue
 
-                    for irhs, rhs in enumerate(component_rhss):
-                        cb(stage_rhss[comp_name, irhs][istage],
-                                rhss_on_entry[comp_name, irhs])
+                        for irhs, rhs in enumerate(component_rhss):
+                            cb(stage_rhss[comp_name][name, irhs][istage],
+                                    rhss_on_entry[comp_name, irhs])
 
-            else:
-                component_state_ests = {}
+                else:
 
-                for icomp, (comp_name, component_rhss) in enumerate(
-                        zip(self.component_names, self.rhss)):
+                    for icomp, (comp_name, component_rhss) in enumerate(
+                            zip(self.component_names, self.rhss)):
 
-                    if not self.is_ode_component[comp_name]:
-                        continue
+                        if not self.is_ode_component[comp_name]:
+                            continue
 
-                    contribs = []
-                    for irhs, rhs in enumerate(component_rhss):
-                        state_contrib_var = var(
+                        contribs = []
+                        for irhs, rhs in enumerate(component_rhss):
+                            state_contrib_var = var(
+                                    name_gen(
+                                        "state_contrib_{comp_name}_rhs{irhs}"
+                                        .format(comp_name=comp_name, irhs=irhs)))
+
+                            contribs.append(state_contrib_var)
+
+                            cb(state_contrib_var,
+                                    _linear_comb(coeffs,
+                                                 stage_rhss[comp_name][name, irhs]))
+
+                        state_var = var(
                                 name_gen(
-                                    "state_contrib_{comp_name}_rhs{irhs}"
-                                    .format(comp_name=comp_name, irhs=irhs)))
+                                    "state_{comp_name}_st{istage}"
+                                    .format(comp_name=comp_name, istage=istage)))
 
-                        contribs.append(state_contrib_var)
+                        state_expr = (
+                                var("<state>" + comp_name)
+                                + (self.dt/self.nsubsteps) * sum(contribs))
+                        if comp_name in self.state_filters:
+                            state_expr = self.state_filters[comp_name](state_expr)
 
-                        cb(state_contrib_var,
-                                _linear_comb(coeffs, stage_rhss[comp_name, irhs]))
+                        cb(state_var, state_expr)
 
-                    state_var = var(
-                            name_gen(
-                                "state_{comp_name}_st{istage}"
-                                .format(comp_name=comp_name, istage=istage)))
+                        component_state_ests[name][comp_name] = state_var
 
-                    state_expr = (
-                            var("<state>" + comp_name)
-                            + (self.dt/self.nsubsteps) * sum(contribs))
-                    if comp_name in self.state_filters:
-                        state_expr = self.state_filters[comp_name](state_expr)
+                    # At this point, we have all the ODE state estimates evaluated.
 
-                    cb(state_var, state_expr)
+                    # {{{ evaluate the non-ODE RHSs
 
-                    component_state_ests[comp_name] = state_var
+                    for comp_name, component_rhss in zip(
+                            self.component_names, self.rhss):
+                        if self.is_ode_component[comp_name]:
+                            continue
 
-                # At this point, we have all the ODE state estimates evaluated.
+                        contribs = []
 
-                # {{{ evaluate the non-ODE RHSs
+                        for irhs, rhs in enumerate(component_rhss):
+                            kwargs = {
+                                    self.comp_name_to_kwarg_name[arg_comp_name]:
+                                        component_state_ests[arg_comp_name]
+                                    for arg_comp_name in rhs.arguments}
 
-                for comp_name, component_rhss in zip(
-                        self.component_names, self.rhss):
-                    if self.is_ode_component[comp_name]:
-                        continue
+                            contribs.append(var(rhs.func_name)(
+                                        t=self.t + (c/self.nsubsteps) * self.dt,
+                                        **kwargs))
 
-                    contribs = []
+                        state_var = var(
+                                name_gen(
+                                    "state_{comp_name}_st{istage}"
+                                    .format(comp_name=comp_name, istage=istage)))
 
-                    for irhs, rhs in enumerate(component_rhss):
-                        kwargs = {
-                                self.comp_name_to_kwarg_name[arg_comp_name]:
-                                    component_state_ests[arg_comp_name]
-                                for arg_comp_name in rhs.arguments}
+                        cb(state_var, sum(contribs))
 
-                        contribs.append(var(rhs.func_name)(
-                                    t=self.t + (c/self.nsubsteps) * self.dt,
-                                    **kwargs))
+                        component_state_ests[name][comp_name] = state_var
 
-                    state_var = var(
-                            name_gen(
-                                "state_{comp_name}_st{istage}"
-                                .format(comp_name=comp_name, istage=istage)))
+                    # }}}
 
-                    cb(state_var, sum(contribs))
+                    # {{{ evaluate the ODE RHSs
 
-                    component_state_ests[comp_name] = state_var
+                    for comp_name, component_rhss in zip(
+                            self.component_names, self.rhss):
 
-                # }}}
+                        if not self.is_ode_component[comp_name]:
+                            continue
 
-                # {{{ evaluate the ODE RHSs
+                        for irhs, rhs in enumerate(component_rhss):
+                            kwargs = {
+                                    self.comp_name_to_kwarg_name[arg_comp_name]:
+                                        component_state_ests[name][arg_comp_name]
+                                    for arg_comp_name in rhs.arguments}
+                            cb(stage_rhss[comp_name][name, irhs][istage],
+                                    var(rhs.func_name)(
+                                        t=self.t + (c/self.nsubsteps) * self.dt,
+                                        **kwargs))
 
-                for comp_name, component_rhss in zip(
-                        self.component_names, self.rhss):
-
-                    if not self.is_ode_component[comp_name]:
-                        continue
-
-                    for irhs, rhs in enumerate(component_rhss):
-                        kwargs = {
-                                self.comp_name_to_kwarg_name[arg_comp_name]:
-                                    component_state_ests[arg_comp_name]
-                                for arg_comp_name in rhs.arguments}
-                        cb(stage_rhss[comp_name, irhs][istage],
-                                var(rhs.func_name)(
-                                    t=self.t + (c/self.nsubsteps) * self.dt,
-                                    **kwargs))
-
-                # }}}
+                    # }}}
 
         component_state_ests = {}
 
         for icomp, (comp_name, component_rhss) in enumerate(
                 zip(self.component_names, self.rhss)):
+            component_state_ests[comp_name] = {}
+            for name in estimate_coeff_set_names:
+                coeffs = estimate_coeff_sets[name]
 
-            contribs = []
-            for irhs, rhs in enumerate(component_rhss):
-                if not self.is_ode_component[comp_name]:
-                    continue
+                contribs = []
+                for irhs, rhs in enumerate(component_rhss):
+                    if not self.is_ode_component[comp_name]:
+                        continue
 
-                state_contrib_var = var(
+                    state_contrib_var = var(
+                            name_gen(
+                                "state_contrib_{comp_name}_{name}_rhs{irhs}"
+                                .format(comp_name=comp_name, name=name, irhs=irhs)))
+
+                    contribs.append(state_contrib_var)
+
+                    # FIXME: assumes only an explicit stage coeff set
+                    cb(state_contrib_var,
+                            _linear_comb(coeffs,
+                                         stage_rhss[comp_name]["explicit", irhs]))
+                state_var = var(
                         name_gen(
-                            "state_contrib_{comp_name}_rhs{irhs}"
-                            .format(comp_name=comp_name, irhs=irhs)))
+                            "state_{comp_name}_{name}_final"
+                            .format(comp_name=comp_name, name=name)))
 
-                contribs.append(state_contrib_var)
+                state_expr = (
+                        var("<state>" + comp_name)
+                        + (self.dt/self.nsubsteps) * sum(contribs))
+                if comp_name in self.state_filters:
+                    state_expr = self.state_filters[comp_name](state_expr)
 
-                cb(state_contrib_var,
-                        _linear_comb(rk_coeffs, stage_rhss[comp_name, irhs]))
+                cb(state_var, state_expr)
 
-            state_var = var(
-                    name_gen(
-                        "state_{comp_name}_final"
-                        .format(comp_name=comp_name)))
+                component_state_ests[comp_name][name] = state_var
 
-            state_expr = (
-                    var("<state>" + comp_name)
-                    + (self.dt/self.nsubsteps) * sum(contribs))
-            if comp_name in self.state_filters:
-                state_expr = self.state_filters[comp_name](state_expr)
+        # Introduce adaptivity here.
+        self.finish_rk_step(cb, component_state_ests)
+        #for component_name in self.component_names:
+        #    state_high = component_state_ests[component_name]["high_order"]
+        #    state_low = component_state_ests[component_name]["low_order"]
+        #    if self.use_high_order:
+        #        state = state_high
+        #    else:
+        #        state = state_low
+        #    if self.is_ode_component[component_name]:
+        #        cb.yield_state(
+        #                state,
+        #                component_name, self.t + self.dt/self.nsubsteps,
+        #                "bootstrap")
 
-            cb(state_var, state_expr)
+        #    cb(var("<state>"+component_name), state)
 
-            component_state_ests[comp_name] = state_var
-
-        for component_name in self.component_names:
-            state = component_state_ests[component_name]
-            if self.is_ode_component[component_name]:
-                cb.yield_state(
-                        state,
-                        component_name, self.t + self.dt/self.nsubsteps,
-                        "bootstrap")
-
-            cb(var("<state>"+component_name), state)
-
-        cb(self.t, self.t + self.dt/self.nsubsteps)
+        #cb(self.t, self.t + self.dt/self.nsubsteps)
 
     # }}}
 
@@ -1783,9 +1899,66 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
                 for comp_name, state_var in zip(
                     self.component_names, self.state_vars)}
 
+        def norm(expr):
+            return var("<builtin>norm_2")(expr)
+
+        def finish_substep(states_low, states_high, component_names):
+            from pymbolic import var
+            from pymbolic.primitives import Comparison, LogicalOr, Max
+            from dagrt.expression import IfThenElse
+
+            norm_start_state = var("norm_start_state")
+            norm_end_state = var("norm_end_state")
+            rel_error_raw = var("rel_error_raw")
+            rel_error = var("rel_error")
+            dt_cand = var("dt_cand")
+            dt_cand_min = var("dt_cand_min")
+            rel_error_check = var("rel_error_check")
+            cb(rel_error, array(len(self.component_names)))
+
+            cb(rel_error_check, 0)
+            cb(dt_cand_min, 1000.0)
+            for i, component_name in enumerate(component_names):
+                state_low = states_low[component_name]
+                state_high = states_high[component_name]
+                cb(norm_start_state, norm(var("<state>"+component_name)))
+                cb(norm_end_state, norm(state_low))
+                cb(rel_error_raw, norm(state_high - state_low)
+                        / (var("<builtin>len")(var("<state>"+component_name)) ** 0.5
+                            * (
+                                self.atol + self.rtol
+                                * Max((norm_start_state, norm_end_state))
+                                )))
+
+                cb(rel_error[i], IfThenElse(Comparison(rel_error_raw, "==", 0),
+                                        1.0e-14, rel_error_raw))
+
+                with cb.if_(LogicalOr((Comparison(rel_error[i], ">", 1),
+                                    var("<builtin>isnan")(rel_error[i])))):
+
+                    cb(rel_error_check, 1)
+                    with cb.if_(var("<builtin>isnan")(rel_error[i])):
+                        cb(dt_cand, self.min_dt_shrinkage * self.dt)
+                    with cb.else_():
+                        cb(dt_cand, Max((0.9 * self.dt
+                            * rel_error[i] ** (-1 / self.high_order),
+                            self.min_dt_shrinkage * self.dt)))
+                    with cb.if_(dt_cand, "<", dt_cand_min):
+                        cb(dt_cand_min, dt_cand)
+
+            # From all candidates, choose the new dt.
+            with cb.if_(rel_error_check, "==", 1):
+                cb(self.dt, dt_cand_min)
+                with cb.if_(self.t + self.dt, "==", self.t):
+                    cb.raise_(TimeStepUnderflow)
+                with cb.else_():
+                    cb(var("printer"),
+                       var("<builtin>print")("failed in substep check"))
+                    cb.fail_step()
+
         # {{{ get_state
 
-        def get_state(comp_name, isubstep):
+        def get_state(comp_name, isubstep, end_states=False):
             states_high = computed_states_high[comp_name]
             states_low = computed_states_low[comp_name]
 
@@ -1912,6 +2085,10 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
             cb(state_var_low, state_expr_low)
             cb(state_var_high, state_expr_high)
 
+            # Check this state to make sure we are within error tolerances.
+            #if not end_states:
+            #    finish_substep(state_var_low, state_var_high, comp_name)
+
             # Only keep temporary state if integrates exactly
             # one interval ahead for the fastest right-hand side,
             # which is the expected rate.
@@ -1957,16 +2134,20 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
             progress_frac = isubstep / self.nsubsteps
             t_expr = self.t + self.dt * progress_frac
 
-            # Need to apply "finish" to state estimates
-            # before they can be used as kwargs
             kwargs_low = {}
             kwargs_high = {}
+            kwarg_names = []
             for arg_comp_name in rhs.arguments:
                 state_var_low, state_var_high = get_state(arg_comp_name, isubstep)
                 # Use finish - do we need to change timestep or is this state usable?
                 key = self.comp_name_to_kwarg_name[arg_comp_name]
+                kwarg_names.append(key)
                 kwargs_low[key] = state_var_low
                 kwargs_high[key] = state_var_high
+
+            # Need to apply "finish" to state estimates
+            # before they can be used as kwargs
+            finish_substep(kwargs_low, kwargs_high, kwarg_names)
 
             # }}}
 
@@ -2041,9 +2222,6 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
 
         # }}}
 
-        def norm(expr):
-            return var("<builtin>norm_2")(expr)
-
         # {{{ run_substep_loop
 
         def run_substep_loop():
@@ -2088,7 +2266,9 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
         end_states_low = []
         end_states_high = []
         for component_name in self.component_names:
-            end_state_low, end_state_high = get_state(component_name, self.nsubsteps)
+            end_state_low, end_state_high = get_state(component_name,
+                                                      self.nsubsteps,
+                                                      end_states=True)
             end_states_low.append(end_state_low)
             end_states_high.append(end_state_high)
 
@@ -2175,7 +2355,7 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
                         cb(dt_cand, self.min_dt_shrinkage * self.dt)
                     with cb.else_():
                         cb(dt_cand, Max((0.9 * self.dt
-                            * rel_error[i] ** (-1 / self.low_order),
+                            * rel_error[i] ** (-1 / self.high_order),
                             self.min_dt_shrinkage * self.dt)))
                     with cb.if_(dt_cand, "<", dt_cand_min):
                         cb(dt_cand_min, dt_cand)
@@ -2186,10 +2366,22 @@ class EmbeddedMultiRateMultiStepMethodBuilder(MethodBuilder):
                 with cb.if_(self.t + self.dt, "==", self.t):
                     cb.raise_(TimeStepUnderflow)
                 with cb.else_():
+                    #cb(var("printer"), var("<builtin>print")(var("<state>slow")))
                     cb.fail_step()
 
             with cb.else_():
                 # This updates <t>: <dt> should not be set before this is called.
+                for i, component_name in enumerate(self.component_names):
+                    if component_name == "fast":
+                        state_low = end_states_low[i]
+                        state_high = end_states_high[i]
+                        # Tracking relative error
+                        # cb(var("printer"),
+                        #    var("<builtin>print")(norm(
+                        #    state_high - state_low)/norm(state_low)))
+                        # Tracking absolute error
+                        cb(var("printer"),
+                           var("<builtin>print")(norm(state_high - state_low)))
                 finish_nonadaptive()
 
                 cb(dt_cand_min, 1000.0)
