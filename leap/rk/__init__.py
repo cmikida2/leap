@@ -45,6 +45,11 @@ __doc__ = """
     A dictionary mapping desired order of accuracy to a corresponding implicit
     RK method builder.
 
+.. data:: EMBEDDED_ORDER_TO_RK_METHOD_BUILDER
+
+    A dictionary mapping desired order of accuracy to a corresponding embedded
+    RK method builder.
+
 .. autoclass:: ForwardEulerMethodBuilder
 .. autoclass:: MidpointMethodBuilder
 .. autoclass:: HeunsMethodBuilder
@@ -331,6 +336,15 @@ class ButcherTableauMethodBuilder(MethodBuilder):
                     from leap.implicit import generate_solve
                     generate_solve(cb, unknowns, equations, rhs_var_to_unknown,
                                     self.state)
+                elif not unknowns:
+                    # we have an explicit Runge-Kutta method
+                    pass
+                elif len(unknowns) > len(equations):
+                    raise ValueError("Runge-Kutta implicit timestep has more "
+                            "unknowns than equations")
+                elif len(unknowns) < len(equations):
+                    raise ValueError("Runge-Kutta implicit timestep has more "
+                            "equations than unknowns")
 
                 del equations[:]
                 knowns.update(unknowns)
@@ -717,7 +731,7 @@ IMPLICIT_ORDER_TO_RK_METHOD_BUILDER = {
         2: DIRK2MethodBuilder,
         3: DIRK3MethodBuilder,
         4: DIRK4MethodBuilder,
-        5: DIRK4MethodBuilder,
+        5: DIRK5MethodBuilder,
         }
 
 # }}}
@@ -871,6 +885,12 @@ class ODE45MethodBuilder(EmbeddedButcherTableauMethodBuilder):
     recycle_last_stage_coeff_set_names = ("explicit",)
 
 # }}}
+
+
+EMBEDDED_ORDER_TO_RK_METHOD_BUILDER = {
+        3: ODE23MethodBuilder,
+        5: ODE45MethodBuilder,
+        }
 
 
 # {{{ Carpenter/Kennedy low-storage fourth-order Runge-Kutta

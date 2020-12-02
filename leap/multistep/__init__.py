@@ -223,7 +223,7 @@ class AdamsMethodBuilder(MethodBuilder):
     """
 
     def __init__(self, component_id, function_family=None, state_filter_name=None,
-            hist_length=None, static_dt=False, order=None, _extra_bootstrap=False):
+            hist_length=None, static_dt=False, order=None):
         """
         :arg function_family: Accepts an instance of
             :class:`AdamsIntegrationFunctionFamily`
@@ -251,7 +251,6 @@ class AdamsMethodBuilder(MethodBuilder):
 
         self.hist_length = hist_length
         self.static_dt = static_dt
-        self.extra_bootstrap = _extra_bootstrap
 
         self.component_id = component_id
 
@@ -303,12 +302,7 @@ class AdamsMethodBuilder(MethodBuilder):
         # Bootstrap
         with CodeBuilder(name="bootstrap") as cb_bootstrap:
             self.rk_bootstrap(cb_bootstrap)
-            cb_bootstrap(self.t, self.t + self.dt)
-            cb_bootstrap.yield_state(expression=self.state,
-                                     component_id=self.component_id,
-                                     time_id="", time=self.t)
-            cb_bootstrap(self.step, self.step + 1)
-            bootstrap_length = self.determine_bootstrap_length()
+            bootstrap_length = self.hist_length
             with cb_bootstrap.if_(self.step, "==", bootstrap_length):
                 cb_bootstrap.switch_phase("primary")
 
@@ -340,40 +334,40 @@ class AdamsMethodBuilder(MethodBuilder):
                                component_id=self.component_id,
                                time_id="", time=self.t)
 
-    def set_up_time_history(self, cb, new_t):
+    def set_up_time_data(self, cb, new_t):
         from pytools import UniqueNameGenerator
         name_gen = UniqueNameGenerator()
         array = var("<builtin>array")
         if not self.static_dt:
-            time_history_data = self.time_history + [new_t]
-            time_hist_var = var(name_gen("time_history"))
-            cb(time_hist_var, array(self.hist_length))
+            time_data = self.time_history + [new_t]
+            time_data_var = var(name_gen("time_data"))
+            cb(time_data_var, array(self.hist_length))
             for i in range(self.hist_length):
-                cb(time_hist_var[i], time_history_data[i] - self.t)
+                cb(time_data_var[i], time_data[i] - self.t)
 
-            time_hist = time_hist_var
+            relv_times = time_data_var
             t_end = self.dt
             dt_factor = 1
 
         else:
             if new_t == self.t:
-                time_hist = list(range(-self.hist_length+1, 0+1))  # noqa pylint:disable=invalid-unary-operand-type
-                time_history_data = list(range(-self.hist_length+1, 0+1))  # noqa pylint:disable=invalid-unary-operand-type
+                relv_times = list(range(-self.hist_length+1, 0+1))  # noqa pylint:disable=invalid-unary-operand-type
+                time_data = list(range(-self.hist_length+1, 0+1))  # noqa pylint:disable=invalid-unary-operand-type
             else:
-                time_hist = list(range(-self.hist_length+2, 0+2))  # noqa pylint:disable=invalid-unary-operand-type
-                time_history_data = list(range(-self.hist_length+2, 0+2))  # noqa pylint:disable=invalid-unary-operand-type
+                # In implicit mode, the vector of times
+                # passed to adams_integration must
+                # include the *next* point in time.
+                relv_times = list(range(-self.hist_length+2, 0+2))  # noqa pylint:disable=invalid-unary-operand-type
+                time_data = list(range(-self.hist_length+2, 0+2))  # noqa pylint:disable=invalid-unary-operand-type
             dt_factor = self.dt
             t_end = 1
 
-        return time_history_data, time_hist, dt_factor, t_end
+        return time_data, relv_times, dt_factor, t_end
 
     def generate_primary(self, cb):
         raise NotImplementedError()
 
     def rk_bootstrap(self, cb):
-        raise NotImplementedError()
-
-    def determine_bootstrap_length(self):
         raise NotImplementedError()
 
 # }}}
@@ -388,7 +382,7 @@ class AdamsBashforthMethodBuilder(AdamsMethodBuilder):
         name_gen = UniqueNameGenerator()
 
         time_history_data, time_hist, \
-                dt_factor, t_end = self.set_up_time_history(cb, self.t)
+                dt_factor, t_end = self.set_up_time_data(cb, self.t)
 
         cb(rhs_var, self.eval_rhs(self.t, self.state))
         history = self.history + [rhs_var]
@@ -445,14 +439,12 @@ class AdamsBashforthMethodBuilder(AdamsMethodBuilder):
 
         # Assign the value of the new state.
         cb(self.state, est_vars[0])
+        cb(self.t, self.t + self.dt)
+        cb.yield_state(expression=self.state,
+                       component_id=self.component_id,
+                       time_id="", time=self.t)
+        cb(self.step, self.step + 1)
 
-    def determine_bootstrap_length(self):
-
-        # In the explicit case, this is always
-        # equal to history length.
-        bootstrap_length = self.hist_length
-
-        return bootstrap_length
 # }}}
 
 
@@ -469,10 +461,11 @@ class AdamsMoultonMethodBuilder(AdamsMethodBuilder):
         unkvar = cb.fresh_var("unk")
         rhs_var_to_unknown[rhs_next_var] = unkvar
 
-        # In implicit mode, the time history must
+        # In implicit mode, the vector of times
+        # passed to adams_integration must
         # include the *next* point in time.
-        time_history_data, time_hist, \
-                dt_factor, t_end = self.set_up_time_history(cb, self.t + self.dt)
+        time_data, relv_times, \
+                dt_factor, t_end = self.set_up_time_data(cb, self.t + self.dt)
 
         # Implicit setup - rhs_next_var is an unknown, needs implicit solve.
         equations = []
@@ -481,14 +474,16 @@ class AdamsMoultonMethodBuilder(AdamsMethodBuilder):
 
         unknowns.add(rhs_next_var)
 
-        # Update history
-        history = self.history + [rhs_next_var]
+        # Create RHS vector for Adams setup,
+        # including RHS value to be implicitly
+        # solved for
+        rhss = self.history + [rhs_next_var]
 
         # Set up the actual Adams-Moulton step.
         am_sum = emit_adams_integration(
                         cb, name_gen,
                         self.function_family,
-                        time_hist, history,
+                        relv_times, rhss,
                         0, t_end)
 
         state_est = self.state + dt_factor * am_sum
@@ -508,6 +503,14 @@ class AdamsMoultonMethodBuilder(AdamsMethodBuilder):
         if unknowns and len(unknowns) == len(equations):
             from leap.implicit import generate_solve
             generate_solve(cb, unknowns, equations, rhs_var_to_unknown, self.state)
+        elif not unknowns:
+            raise ValueError("Adams-Moulton implicit timestep has no unknowns")
+        elif len(unknowns) > len(equations):
+            raise ValueError("Adams-Moulton implicit timestep has more unknowns "
+                    "than equations")
+        elif len(unknowns) < len(equations):
+            raise ValueError("Adams-Moulton implicit timestep has more equations "
+                    "than unknowns")
 
         del equations[:]
         knowns.update(unknowns)
@@ -520,8 +523,9 @@ class AdamsMoultonMethodBuilder(AdamsMethodBuilder):
             state_est = self.state_filter(state_est)
         cb(self.state, state_est)
 
-        # Rotate history and time history.
-        self.rotate_and_yield(cb, history, time_history_data)
+        # Add new RHS and time to history and rotate.
+        history = self.history + [rhs_next_var]
+        self.rotate_and_yield(cb, history, time_data)
 
     def rk_bootstrap(self, cb):
         """Initialize the timestepper with an IMPLICIT RK method."""
@@ -534,21 +538,6 @@ class AdamsMoultonMethodBuilder(AdamsMethodBuilder):
         estimate_coeff_set_names = ("main",)
         estimate_coeff_sets = {"main": rk_coeffs}
         rhs_funcs = {"implicit": var("<func>"+self.component_id)}
-
-        if self.extra_bootstrap:
-            first_save_step = 2
-        else:
-            first_save_step = 1
-
-        with cb.if_(self.step, "==", first_save_step):
-            # Save the first RHS to the AM history
-            rhs_var = var("rhs_var")
-
-            cb(rhs_var, self.eval_rhs(self.t, self.state))
-            cb(self.history[0], rhs_var)
-
-            if not self.static_dt:
-                cb(self.time_history[0], self.t)
 
         # Traverse RK stage loop of appropriate order and update state.
         rk = rk_method(self.component_id, self.state_filter_name)
@@ -569,30 +558,20 @@ class AdamsMoultonMethodBuilder(AdamsMethodBuilder):
 
         cb(rhs_next_var, self.eval_rhs(self.t + self.dt, self.state))
 
-        for i in range(1, len(self.history)):
-            if self.extra_bootstrap:
-                save_crit = i+1
-            else:
-                save_crit = i
+        for i in range(len(self.history)):
 
-            with cb.if_(self.step, "==", save_crit):
+            with cb.if_(self.step, "==", i + 1):
                 cb(self.history[i], rhs_next_var)
 
                 if not self.static_dt:
                     cb(self.time_history[i], self.t + self.dt)
 
-    def determine_bootstrap_length(self):
-
-        # In the implicit case, this is
-        # equal to history length - 1, unless
-        # we want an extra bootstrap step for
-        # comparison with explicit methods.
-        if self.extra_bootstrap:
-            bootstrap_length = self.hist_length
-        else:
-            bootstrap_length = self.hist_length - 1
-
-        return bootstrap_length
+        # moved here because of adaptivity
+        cb(self.t, self.t + self.dt)
+        cb.yield_state(expression=self.state,
+                       component_id=self.component_id,
+                       time_id="", time=self.t)
+        cb(self.step, self.step + 1)
 
 # }}}
 
@@ -610,7 +589,7 @@ class EmbeddedAdamsMethodBuilder(
 
     def __init__(self, component_id, function_family=None, state_filter_name=None,
             hist_length=None, static_dt=False, order=None, _extra_bootstrap=False,
-            use_high_order=False, atol=0, rtol=0, max_dt_growth=None,
+            use_high_order=True, atol=0, rtol=0, max_dt_growth=None,
             min_dt_shrinkage=None, implicit=False):
         """
         :arg function_family: Accepts an instance of
@@ -630,6 +609,10 @@ class EmbeddedAdamsMethodBuilder(
             function_families.append(order)
             self.low_order = order
             self.high_order = order + 1
+            #if not implicit:
+            #    self.high_order = order + 1
+            #else:
+            #    self.high_order = order
             if not implicit:
                 function_families.append(order + 1)
             del order
@@ -647,6 +630,8 @@ class EmbeddedAdamsMethodBuilder(
 
         if hist_length is None:
             hist_length = function_families[0] + 1
+            #FIXME hist length change
+            #hist_length = function_families[0] + 2
 
         # Check for reasonable history length.
         if hist_length < function_families[0] + 1:
@@ -698,6 +683,8 @@ class EmbeddedAdamsMethodBuilder(
                 min_dt_shrinkage=min_dt_shrinkage,
                 single_order=single_order)
 
+        self.atol = atol
+        self.rtol = rtol
         self.use_high_order = use_high_order
 
     def generate_primary(self, cb):
@@ -719,58 +706,58 @@ class EmbeddedAdamsMethodBuilder(
             unknowns.add(rhs_next_var)
             # In implicit mode, the time history must
             # include the *next* point in time.
-            time_history_data, time_hist, \
-                    dt_factor, t_end = self.set_up_time_history(cb, self.t + self.dt)
-            history = self.history + [rhs_next_var]
+            time_data, relv_times, \
+                    dt_factor, t_end = self.set_up_time_data(cb, self.t + self.dt)
+            rhss = self.history + [rhs_next_var]
         else:
-            time_history_data, time_hist, \
-                    dt_factor, t_end = self.set_up_time_history(cb, self.t)
+            time_data, relv_times, \
+                    dt_factor, t_end = self.set_up_time_data(cb, self.t)
             cb(rhs_var, self.eval_rhs(self.t, self.state))
-            history = self.history + [rhs_var]
+            rhss = self.history + [rhs_var]
 
         # Create history to feed to AB.
-        time_hist_ab_var = var(name_gen("time_history_ab"))
-        cb(time_hist_ab_var, array(self.hist_length-1))
+        relv_times_ab_var = var(name_gen("time_data_ab"))
+        cb(relv_times_ab_var, array(self.hist_length-1))
         if self.implicit:
-            history_ab = history[:-1]
+            rhss_ab = rhss[:-1]
             for i in range(self.hist_length-1):
-                cb(time_hist_ab_var[i], time_hist[i])
+                cb(relv_times_ab_var[i], relv_times[i])
         else:
-            history_ab = history[1:]
+            rhss_ab = rhss[1:]
             for i in range(self.hist_length-1):
-                cb(time_hist_ab_var[i], time_hist[i+1])
+                cb(relv_times_ab_var[i], relv_times[i+1])
 
-        time_hist_ab = time_hist_ab_var
+        relv_times_ab = relv_times_ab_var
 
         # Set up the actual Adams-Bashforth and (if implicit) Adams-Moulton steps.
         ab_sum = emit_adams_integration(
                         cb, name_gen,
                         self.function_families[0],
-                        time_hist_ab, history_ab,
+                        relv_times_ab, rhss_ab,
                         0, t_end)
 
         if self.implicit:
             # Create history to feed to AM.
-            history_am = history[1:]
-            time_hist_am_var = var(name_gen("time_history_am"))
-            cb(time_hist_am_var, array(self.hist_length-1))
+            rhss_am = rhss[1:]
+            relv_times_am_var = var(name_gen("time_data_am"))
+            cb(relv_times_am_var, array(self.hist_length-1))
             for i in range(self.hist_length-1):
-                cb(time_hist_am_var[i], time_hist[i+1])
+                cb(relv_times_am_var[i], relv_times[i+1])
 
-            time_hist_am = time_hist_am_var
+            relv_times_am = relv_times_am_var
 
             # Create AM estimate.
             am_sum = emit_adams_integration(
                             cb, name_gen,
                             self.function_families[0],
-                            time_hist_am, history_am,
+                            relv_times_am, rhss_am,
                             0, t_end)
         else:
             # Create higher-order AB estimate.
             ab_sum_high = emit_adams_integration(
                             cb, name_gen,
                             self.function_families[1],
-                            time_hist, history,
+                            relv_times, rhss,
                             0, t_end)
 
         state_est_low = self.state + dt_factor * ab_sum
@@ -796,6 +783,15 @@ class EmbeddedAdamsMethodBuilder(
             from leap.implicit import generate_solve
             generate_solve(cb, unknowns, equations,
                            rhs_var_to_unknown, state_est_low)
+        elif not unknowns:
+            # if we are fully explicit, we may not have any solves to do
+            pass
+        elif len(unknowns) > len(equations):
+            raise ValueError("Adaptive Adams implicit timestep has more "
+                    "unknowns than equations")
+        elif len(unknowns) < len(equations):
+            raise ValueError("Adaptive Adams implicit timestep has more "
+                    "equations than unknowns")
 
         del equations[:]
         knowns.update(unknowns)
@@ -809,18 +805,30 @@ class EmbeddedAdamsMethodBuilder(
             state_est_high = self.state_filter(state_est_high)
 
         # Finish needs to intervene here.
-        self.finish(cb, state_est_high, state_est_low, history, time_history_data)
+        self.finish(cb, state_est_high, state_est_low, rhss, time_data)
 
-    def finish(self, cb, high_est, low_est, hist, time_hist):
+    def finish(self, cb, high_est, low_est, rhss, time_data):
         if not self.adaptive:
+            def norm(expr):
+                return var("<builtin>norm_2")(expr)
+            from pymbolic import var
+            rel_error_raw = var("rel_error_raw")
+            norm_start_state = var("norm_start_state")
+            norm_end_state = var("norm_end_state")
+            cb(norm_start_state, norm(low_est))
+            cb(norm_end_state, norm(high_est-self.state))
+            #cb(rel_error_raw, norm(high_est - low_est)
+            #        / norm_start_state)
+            cb(rel_error_raw, norm(high_est - low_est))
+            cb(var("printer"), var("<builtin>print")(rel_error_raw))
             cb(self.state, low_est)
             # Rotate history and time history.
-            self.rotate_and_yield(cb, hist, time_hist)
+            self.rotate_and_yield(cb, rhss, time_data)
         else:
-            self.finish_adaptive_hist(cb, high_est, low_est, hist, time_hist)
+            self.finish_adaptive_hist(cb, high_est, low_est, rhss, time_data)
 
     def finish_nonadaptive_hist(self, cb, high_order_estimate,
-                           low_order_estimate, hist, time_hist):
+                           low_order_estimate, rhss, time_data):
         if self.use_high_order:
             est = high_order_estimate
         else:
@@ -828,10 +836,35 @@ class EmbeddedAdamsMethodBuilder(
 
         cb(self.state, est)
         # Rotate history and time history.
-        self.rotate_and_yield(cb, hist, time_hist)
+        self.rotate_and_yield(cb, rhss, time_data)
+
+    def finish_bootstrap(self, cb, estimate_coeff_set_names, estimate_vars):
+        if not self.adaptive:
+            super().finish(
+                    cb, estimate_coeff_set_names, estimate_vars)
+        else:
+            high_est = estimate_vars[
+                    estimate_coeff_set_names.index("high_order")]
+            low_est = estimate_vars[
+                    estimate_coeff_set_names.index("low_order")]
+            self.finish_adaptive(cb, high_est, low_est)
+
+    def finish_nonadaptive(self, cb, high_order_estimate, low_order_estimate):
+        if self.use_high_order:
+            est = high_order_estimate
+        else:
+            est = low_order_estimate
+
+        cb(var("printer"), var("<builtin>print")("Outputting bootstrap state"))
+        cb(self.state, est)
+        cb(self.t, self.t + self.dt)
+        cb.yield_state(expression=self.state,
+                       component_id=self.component_id,
+                       time_id="", time=self.t)
+        cb(self.step, self.step + 1)
 
     def rk_bootstrap(self, cb):
-        """Initialize the timestepper with an RK method."""
+        """Initialize the timestepper with an adaptive RK method."""
 
         rhs_var = var("rhs_var")
 
@@ -846,17 +879,21 @@ class EmbeddedAdamsMethodBuilder(
                 if not self.static_dt:
                     cb(self.time_history[i], self.t)
 
-        from leap.rk import ORDER_TO_RK_METHOD_BUILDER
-        rk_method = ORDER_TO_RK_METHOD_BUILDER[self.function_families[0].order]
-        rk_coeffs = rk_method.output_coeffs
+        from leap.rk import EMBEDDED_ORDER_TO_RK_METHOD_BUILDER
+        rk_method = EMBEDDED_ORDER_TO_RK_METHOD_BUILDER[
+                self.function_families[0].order+1]
+        high_order_coeffs = rk_method.high_order_coeffs
+        low_order_coeffs = rk_method.low_order_coeffs
         stage_coeff_set_names = ("explicit",)
         stage_coeff_sets = {"explicit": rk_method.a_explicit}
-        estimate_coeff_set_names = ("main",)
-        estimate_coeff_sets = {"main": rk_coeffs}
+        estimate_coeff_set_names = ("high_order", "low_order")
+        estimate_coeff_sets = {"high_order": high_order_coeffs,
+                               "low_order": low_order_coeffs}
         rhs_funcs = {"explicit": var("<func>"+self.component_id)}
 
         # Traverse RK stage loop of appropriate order and update state.
-        rk = rk_method(self.component_id, self.state_filter_name)
+        rk = rk_method(self.component_id, state_filter_name=self.state_filter_name,
+                       rtol=self.rtol)
         cb = rk.generate_butcher_init(cb, stage_coeff_set_names,
                                       stage_coeff_sets, rhs_funcs,
                                       estimate_coeff_set_names,
@@ -866,16 +903,8 @@ class EmbeddedAdamsMethodBuilder(
                                                          estimate_coeff_set_names,
                                                          estimate_coeff_sets)
 
-        # Assign the value of the new state.
-        cb(self.state, est_vars[0])
-
-    def determine_bootstrap_length(self):
-
-        # In the explicit case, this is always
-        # equal to history length.
-        bootstrap_length = self.hist_length
-
-        return bootstrap_length
+        # Adaptive finish
+        self.finish_bootstrap(cb, estimate_coeff_set_names, est_vars)
 
 # }}}
 
