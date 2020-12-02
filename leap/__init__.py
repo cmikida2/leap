@@ -180,12 +180,13 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
         cb(norm_start_state, norm(self.state))
         cb(norm_end_state, norm(low_order_estimate))
         if self.single_order:
-            cb(rel_error_raw, abs(self.c_imp[self.low_order-1])
+            cb(rel_error_raw, abs(self.c_exp[self.low_order-1])
                     * norm(high_order_estimate - low_order_estimate)
                     / (abs(self.c_exp[self.low_order-1]
                         - self.c_imp[self.low_order-1])
+                        * (var("<builtin>len")(self.state) ** 0.5
                         * ((self.atol + self.rtol
-                            * Max((norm_start_state, norm_end_state))))
+                            * Max((norm_start_state, norm_end_state)))))
                        )
                )
         else:
@@ -206,7 +207,7 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
                 cb(self.dt, self.min_dt_shrinkage * self.dt)
             with cb.else_():
                 cb(self.dt, Max((0.9 * self.dt
-                    * rel_error ** (-1 / self.low_order),
+                    * rel_error ** (-1.0 / (self.low_order)),
                     self.min_dt_shrinkage * self.dt)))
 
             with cb.if_(self.t + self.dt, "==", self.t):
@@ -220,7 +221,7 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
                                     hist, time_hist)
 
             cb(self.dt,
-               Min((0.9 * self.dt * rel_error ** (-1 / self.high_order),
+               Min((0.9 * self.dt * rel_error ** (-1.0 / (self.high_order)),
                     self.max_dt_growth * self.dt)))
 
 # }}}
