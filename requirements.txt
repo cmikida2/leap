@@ -1,3 +1,4 @@
 git+https://github.com/inducer/pytools.git
 git+https://github.com/inducer/pymbolic.git
-git+https://github.com/inducer/dagrt.git
+git+https://github.com/cmikida2/dagrt.git@reactors
+git+https://github.com/cmikida2/pyrometheus.git

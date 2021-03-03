@@ -887,6 +887,29 @@ class ODE45MethodBuilder(EmbeddedButcherTableauMethodBuilder):
 # }}}
 
 
+# {{{ Conde et al. SSPERK(4,3) w/embedded second-order pair
+
+class SSP43MethodBuilder(EmbeddedButcherTableauMethodBuilder):
+
+    # Embedded SSP pair from Conde et al.
+    c = [0, 1/2, 1, 1/2]
+    a_explicit = [
+            [],
+            [1/2],
+            [1/2, 1/2],
+            [1/6, 1/6, 1/6],
+            ]
+
+    low_order = 2
+    low_order_coeffs = [1/4, 1/4, 1/4, 1/4]
+    high_order = 3
+    high_order_coeffs = [1/6, 1/6, 1/6, 1/2]
+
+    recycle_last_stage_coeff_set_names = ("explicit",)
+
+# }}}
+
+
 EMBEDDED_ORDER_TO_RK_METHOD_BUILDER = {
         3: ODE23MethodBuilder,
         5: ODE45MethodBuilder,

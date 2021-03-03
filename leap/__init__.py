@@ -124,14 +124,20 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
         def norm(expr):
             return var("<builtin>norm_2")(expr)
 
+        def weighted_norm(expr1, expr2, expr3, atol, rtol):
+            return var("<builtin>norm_wrms")(expr1, expr2, expr3, atol, rtol)
+
         cb(norm_start_state, norm(self.state))
         cb(norm_end_state, norm(low_order_estimate))
-        cb(rel_error_raw, norm(high_order_estimate - low_order_estimate)
-                / (var("<builtin>len")(self.state) ** 0.5
-                    * (
-                        self.atol + self.rtol
-                        * Max((norm_start_state, norm_end_state))
-                        )))
+        #cb(rel_error_raw, norm(high_order_estimate - low_order_estimate)
+        #        / (var("<builtin>len")(self.state) ** 0.5
+        #            * (
+        #                self.atol + self.rtol
+        #                * Max((norm_start_state, norm_end_state))
+        #                )))
+        # Use weighted norm instead.
+        cb(rel_error_raw, weighted_norm(high_order_estimate - low_order_estimate,
+           self.state, high_order_estimate, self.atol, self.rtol))
 
         cb(rel_error, IfThenElse(Comparison(rel_error_raw, "==", 0),
                                  1.0e-14, rel_error_raw))
@@ -142,8 +148,9 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
             with cb.if_(var("<builtin>isnan")(rel_error)):
                 cb(self.dt, self.min_dt_shrinkage * self.dt)
             with cb.else_():
+                # FIXME: What should the power here be?
                 cb(self.dt, Max((0.9 * self.dt
-                    * rel_error ** (-1 / self.low_order),
+                    * rel_error ** (-1 / self.high_order),
                     self.min_dt_shrinkage * self.dt)))
 
             with cb.if_(self.t + self.dt, "==", self.t):
@@ -153,6 +160,9 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
 
         with cb.else_():
             # This updates <t>: <dt> should not be set before this is called.
+            cb.yield_state(expression=rel_error_raw,
+                        component_id="y",
+                        time_id="y_err", time=self.t + self.dt)
             self.finish_nonadaptive(cb, high_order_estimate, low_order_estimate)
 
             cb(self.dt,
@@ -177,6 +187,9 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
         def norm(expr):
             return var("<builtin>norm_2")(expr)
 
+        def weighted_norm(expr1, expr2, expr3, atol, rtol):
+            return var("<builtin>norm_wrms")(expr1, expr2, expr3, atol, rtol)
+
         cb(norm_start_state, norm(self.state))
         cb(norm_end_state, norm(low_order_estimate))
         if self.single_order:
@@ -190,12 +203,14 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
                        )
                )
         else:
-            cb(rel_error_raw, norm(high_order_estimate - low_order_estimate)
-                    / (var("<builtin>len")(self.state) ** 0.5
-                        * (
-                            self.atol + self.rtol
-                            * Max((norm_start_state, norm_end_state))
-                            )))
+            #cb(rel_error_raw, norm(high_order_estimate - low_order_estimate)
+            #        / (var("<builtin>len")(self.state) ** 0.5
+            #            * (
+            #                self.atol + self.rtol
+            #                * Max((norm_start_state, norm_end_state))
+            #                )))
+            cb(rel_error_raw, weighted_norm(high_order_estimate - low_order_estimate,
+               self.state, low_order_estimate, self.atol, self.rtol))
 
         cb(rel_error, IfThenElse(Comparison(rel_error_raw, "==", 0),
                                  1.0e-14, rel_error_raw))
@@ -206,8 +221,9 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
             with cb.if_(var("<builtin>isnan")(rel_error)):
                 cb(self.dt, self.min_dt_shrinkage * self.dt)
             with cb.else_():
+                # FIXME: What should the power here be?
                 cb(self.dt, Max((0.9 * self.dt
-                    * rel_error ** (-1.0 / (self.low_order)),
+                    * rel_error ** (-1.0 / (self.high_order)),
                     self.min_dt_shrinkage * self.dt)))
 
             with cb.if_(self.t + self.dt, "==", self.t):
@@ -217,6 +233,9 @@ class AdaptiveMethodBuilderMixin(MethodBuilder):
 
         with cb.else_():
             # This updates <t>: <dt> should not be set before this is called.
+            cb.yield_state(expression=rel_error_raw,
+                        component_id="y",
+                        time_id="y_err", time=self.t + self.dt)
             self.finish_nonadaptive_hist(cb, high_order_estimate, low_order_estimate,
                                     hist, time_hist)
 
